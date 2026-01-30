@@ -10,7 +10,13 @@ export type ModelCompatConfig = {
   supportsStore?: boolean;
   supportsDeveloperRole?: boolean;
   supportsReasoningEffort?: boolean;
+  supportsUsageInStreaming?: boolean;
   maxTokensField?: "max_completion_tokens" | "max_tokens";
+  requiresToolResultName?: boolean;
+  requiresAssistantAfterToolResult?: boolean;
+  requiresThinkingAsText?: boolean;
+  requiresMistralToolIds?: boolean;
+  thinkingFormat?: "openai" | "zai";
 };
 
 export type ModelProviderAuthMode = "api-key" | "aws-sdk" | "oauth" | "token";

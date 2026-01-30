@@ -1,8 +1,8 @@
 import type { StreamFn } from "@mariozechner/pi-agent-core";
-import type { Api, Model, SimpleStreamOptions } from "@mariozechner/pi-ai";
+import type { Api, Model, SimpleStreamOptions, ThinkingBudgets } from "@mariozechner/pi-ai";
 import { streamSimple } from "@mariozechner/pi-ai";
 
-import type { MoltbotConfig } from "../../config/config.js";
+import type { OpenClawConfig } from "../../config/config.js";
 import { log } from "./logger.js";
 
 /**
@@ -12,7 +12,7 @@ import { log } from "./logger.js";
  * @internal Exported for testing only
  */
 export function resolveExtraParams(params: {
-  cfg: MoltbotConfig | undefined;
+  cfg: OpenClawConfig | undefined;
   provider: string;
   modelId: string;
 }): Record<string, unknown> | undefined {
@@ -22,6 +22,62 @@ export function resolveExtraParams(params: {
 }
 
 type CacheControlTtl = "5m" | "1h";
+type ThinkingLevel = "minimal" | "low" | "medium" | "high" | "xhigh";
+type PayloadAuditLevel = "debug" | "info";
+
+const THINKING_LEVELS = new Set<ThinkingLevel>(["minimal", "low", "medium", "high", "xhigh"]);
+
+function normalizeThinkingLevel(raw: unknown): ThinkingLevel | undefined {
+  if (typeof raw !== "string") return undefined;
+  const normalized = raw.trim().toLowerCase();
+  if (!normalized) return undefined;
+  return THINKING_LEVELS.has(normalized as ThinkingLevel)
+    ? (normalized as ThinkingLevel)
+    : undefined;
+}
+
+function resolveThinkingBudgets(raw: unknown): ThinkingBudgets | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const source = raw as Record<string, unknown>;
+  const budgets: ThinkingBudgets = {};
+  if (typeof source.minimal === "number") budgets.minimal = source.minimal;
+  if (typeof source.low === "number") budgets.low = source.low;
+  if (typeof source.medium === "number") budgets.medium = source.medium;
+  if (typeof source.high === "number") budgets.high = source.high;
+  return Object.keys(budgets).length > 0 ? budgets : undefined;
+}
+
+function resolveHeaders(raw: unknown): Record<string, string> | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const headers: Record<string, string> = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof value === "string") {
+      headers[key] = value;
+    }
+  }
+  return Object.keys(headers).length > 0 ? headers : undefined;
+}
+
+function resolvePayloadAudit(raw: unknown): PayloadAuditLevel | undefined {
+  if (raw === true) return "debug";
+  if (raw === "debug" || raw === "info") return raw;
+  return undefined;
+}
+
+function resolvePayloadOverrides(
+  extraParams: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  if (!extraParams) return undefined;
+  const overrides: Record<string, unknown> = {};
+  const payloadOverrides = extraParams.payloadOverrides ?? extraParams.payloadOverride;
+  if (payloadOverrides && typeof payloadOverrides === "object") {
+    Object.assign(overrides, payloadOverrides as Record<string, unknown>);
+  }
+  if (typeof extraParams.partial === "boolean") {
+    overrides.partial = extraParams.partial;
+  }
+  return Object.keys(overrides).length > 0 ? overrides : undefined;
+}
 
 function resolveCacheControlTtl(
   extraParams: Record<string, unknown> | undefined,
@@ -33,6 +89,28 @@ function resolveCacheControlTtl(
   if (provider === "anthropic") return raw;
   if (provider === "openrouter" && modelId.startsWith("anthropic/")) return raw;
   return undefined;
+}
+
+function mergeHeaders(
+  base: Record<string, string> | undefined,
+  override: Record<string, string> | undefined,
+): Record<string, string> | undefined {
+  if (!base && !override) return undefined;
+  return { ...(base ?? {}), ...(override ?? {}) };
+}
+
+function mergePayloadHandlers(
+  base: ((payload: unknown) => void) | undefined,
+  override: ((payload: unknown) => void) | undefined,
+): ((payload: unknown) => void) | undefined {
+  if (!base && !override) return undefined;
+  if (base && override) {
+    return (payload) => {
+      base(payload);
+      override(payload);
+    };
+  }
+  return base ?? override;
 }
 
 function createStreamFnWithExtraParams(
@@ -56,6 +134,35 @@ function createStreamFnWithExtraParams(
   if (cacheControlTtl) {
     streamParams.cacheControlTtl = cacheControlTtl;
   }
+  const reasoning = normalizeThinkingLevel(extraParams.reasoning ?? extraParams.thinking);
+  if (reasoning) {
+    streamParams.reasoning = reasoning;
+  }
+  const thinkingBudgets = resolveThinkingBudgets(extraParams.thinkingBudgets);
+  if (thinkingBudgets) {
+    streamParams.thinkingBudgets = thinkingBudgets;
+  }
+  if (typeof extraParams.sessionId === "string" && extraParams.sessionId.trim()) {
+    streamParams.sessionId = extraParams.sessionId.trim();
+  }
+  const headers = resolveHeaders(extraParams.headers);
+  if (headers) {
+    streamParams.headers = headers;
+  }
+
+  const payloadOverrides = resolvePayloadOverrides(extraParams);
+  const payloadAudit = resolvePayloadAudit(extraParams.payloadAudit);
+  if (payloadOverrides || payloadAudit) {
+    streamParams.onPayload = (payload) => {
+      if (payloadOverrides && payload && typeof payload === "object") {
+        Object.assign(payload as Record<string, unknown>, payloadOverrides);
+      }
+      if (payloadAudit) {
+        const logger = payloadAudit === "info" ? log.info.bind(log) : log.debug.bind(log);
+        logger(`payload audit (${provider}/${modelId}): ${JSON.stringify(payload)}`);
+      }
+    };
+  }
 
   if (Object.keys(streamParams).length === 0) {
     return undefined;
@@ -64,11 +171,18 @@ function createStreamFnWithExtraParams(
   log.debug(`creating streamFn wrapper with params: ${JSON.stringify(streamParams)}`);
 
   const underlying = baseStreamFn ?? streamSimple;
-  const wrappedStreamFn: StreamFn = (model, context, options) =>
-    underlying(model as Model<Api>, context, {
-      ...streamParams,
+  const wrappedStreamFn: StreamFn = (model, context, options) => {
+    const { headers: baseHeaders, onPayload: baseOnPayload, ...baseParams } = streamParams;
+    const mergedHeaders = mergeHeaders(baseHeaders, options?.headers);
+    const mergedOnPayload = mergePayloadHandlers(baseOnPayload, options?.onPayload);
+
+    return underlying(model as Model<Api>, context, {
+      ...baseParams,
       ...options,
+      headers: mergedHeaders,
+      onPayload: mergedOnPayload,
     });
+  };
 
   return wrappedStreamFn;
 }
@@ -80,7 +194,7 @@ function createStreamFnWithExtraParams(
  */
 export function applyExtraParamsToAgent(
   agent: { streamFn?: StreamFn },
-  cfg: MoltbotConfig | undefined,
+  cfg: OpenClawConfig | undefined,
   provider: string,
   modelId: string,
   extraParamsOverride?: Record<string, unknown>,
